@@ -3,10 +3,20 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 )
+
+const (
+	DELIMITER = "^]"
+)
+
+type Service interface {
+	Register(net.Conn) error
+}
 
 type Topic struct {
 	Value []byte
@@ -17,7 +27,7 @@ type Broker struct {
 	mux         *sync.Mutex
 	Addr        string
 	Topics      []string
-	Publishers  map[string]string     // address of publisher = topic (one topic per publisher only)
+	Publishers  map[string]string     // address of producer = topic (one topic per producer only)
 	Subscribers map[string][]net.Conn // topic = addresses of consumers subscribed to the topic
 }
 
@@ -27,6 +37,7 @@ func NewBroker(ctx context.Context, addr string) *Broker {
 		mux:         &sync.Mutex{},
 		Addr:        addr,
 		Topics:      []string{},
+		Publishers:  map[string]string{},
 		Subscribers: map[string][]net.Conn{},
 	}
 }
@@ -43,17 +54,25 @@ func (b *Broker) Listen(listener net.Listener) error {
 	errc := make(chan error)
 
 	for {
-		select {
-		case err := <-errc:
+		conn, err := listener.Accept()
+		if err != nil {
 			return err
-		default:
-			conn, err := listener.Accept()
-			if err != nil {
-				return err
-			}
-			go b.handleConnection(conn, errc)
 		}
+		go b.handleConnection(conn, errc)
 	}
+
+	// for {
+	// 	select {
+	// 	case err := <-errc:
+	// 		return err
+	// 	default:
+	// 		conn, err := listener.Accept()
+	// 		if err != nil {
+	// 			return err
+	// 		}
+	// 		go b.handleConnection(conn, errc)
+	// 	}
+	// }
 }
 
 func (b *Broker) handleConnection(conn net.Conn, errc chan error) {
@@ -70,12 +89,30 @@ func (b *Broker) handleConnection(conn net.Conn, errc chan error) {
 		// Do necessary operations based on the action received
 		switch action {
 		case "register":
+			serviceType := content[0]
+			// Check if producer or consumer
+			switch serviceType {
+			case "producer":
+				if len(content) < 2 {
+					errc <- errors.New("Invalid topic")
+					return
+				}
+				b.Publishers[conn.RemoteAddr().String()] = content[1]
+			case "consumer":
+			default:
+				errc <- errors.New("Invalid service type")
+				return
+			}
+
+			_, err := conn.Write([]byte("OK"))
+			if err != nil {
+				errc <- err
+			}
 		case "pub":
 			reqc <- content
 		case "sub":
 		case "unsub":
 		}
-
 	}
 }
 
@@ -85,7 +122,7 @@ func (b *Broker) read(conn net.Conn) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	fmt.Println("Received message: ", string(buff[:n]))
+	fmt.Println("Received:", buff[:n])
 	return buff[:n], nil
 }
 
@@ -105,14 +142,14 @@ func (b *Broker) write(conn net.Conn, value []byte) error {
 //
 // e.g.
 //
-//   - register^]subscriber -- the request is a subscriber
-//   - register^]publisher^]topic -- the request is a publisher of `topic`
-//   - pub^]topic -- the request is from a publisher publishing on its own `topic`
-//   - sub^]topic -- the request is from a subscriber subscribing to `topic`
-//   - unsub^]topic -- the request is from a subscriber unsubscribing to `topic`
+//   - register^]consumer -- the request is a consumer
+//   - register^]producer^]topic -- the request is a producer of `topic`
+//   - pub^]topic -- the request is from a producer publishing on its own `topic`
+//   - sub^]topic -- the request is from a consumer subscribing to `topic`
+//   - unsub^]topic -- the request is from a consumer unsubscribing to `topic`
 func ParseRequest(b []byte) (string, []string) {
-	sep := []byte("^]")
-	split := bytes.SplitAfter(b, sep)
+	sep := []byte(DELIMITER)
+	split := bytes.Split(b, sep)
 	if len(split) == 0 {
 		return "", nil
 	}
@@ -124,14 +161,38 @@ func ParseRequest(b []byte) (string, []string) {
 	return string(split[0]), contents
 }
 
-// Add subscriber to the `Subscribers` map
-func (b *Broker) Subscribe(conn net.Conn) error {
-	return nil
+// Add consumer to the `Subscribers` map
+func (b *Broker) Subscribe(topic string, conn net.Conn) {
+	b.mux.Lock()
+	defer b.mux.Unlock()
+	consumers, ok := b.Subscribers[topic]
+	if !ok {
+		b.Subscribers[topic] = []net.Conn{conn}
+		return
+	}
+
+	if !slices.Contains(consumers, conn) {
+		consumers = append(consumers, conn)
+		b.Subscribers[topic] = consumers
+	}
 }
 
-// Remove subscriber from the `Subscribers` map
-func (b *Broker) Unsubscribe(topic string, conn net.Conn) error {
-	return nil
+// Remove consumer from the `Subscribers` map
+func (b *Broker) Unsubscribe(topic string, conn net.Conn) {
+	b.mux.Lock()
+	defer b.mux.Unlock()
+	consumers, ok := b.Subscribers[topic]
+	if !ok {
+		return
+	}
+
+	for i, s := range consumers {
+		if s == conn {
+			consumers = append(consumers[:i], consumers...)
+			b.Subscribers[topic] = consumers
+			break
+		}
+	}
 }
 
 type Producer struct {
@@ -153,9 +214,42 @@ func NewProducer(ctx context.Context, addr string, topic string) *Producer {
 func (p *Producer) Start() (net.Conn, error) {
 	conn, err := net.Dial("tcp", p.Addr)
 	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	// Register serivce on start-up
+	err = p.Register(conn)
+	if err != nil {
+		conn.Close()
 		return nil, err
 	}
 	return conn, nil
+}
+
+func (p *Producer) Register(conn net.Conn) error {
+	_, err := conn.Write([]byte("register" + DELIMITER + "producer" + DELIMITER + p.Topic))
+	if err != nil {
+		return err
+	}
+
+	buff := make([]byte, 128)
+	n, err := conn.Read(buff)
+	if err != nil {
+		return err
+	}
+	if string(buff[:n]) != "OK" {
+		return errors.New("Unable to register service")
+	}
+	return nil
+}
+
+func (p *Producer) Publish(conn net.Conn, body string) error {
+	_, err := conn.Write([]byte(body))
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 type Consumer struct {
