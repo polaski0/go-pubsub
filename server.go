@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"slices"
 	"sync"
@@ -50,29 +49,15 @@ func (b *Broker) Start() (net.Listener, error) {
 	return listener, nil
 }
 
-func (b *Broker) Listen(listener net.Listener) error {
-	errc := make(chan error)
-
+func (b *Broker) Listen(listener net.Listener, errc chan error) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			return err
+			errc <- err
+			return
 		}
 		go b.handleConnection(conn, errc)
 	}
-
-	// for {
-	// 	select {
-	// 	case err := <-errc:
-	// 		return err
-	// 	default:
-	// 		conn, err := listener.Accept()
-	// 		if err != nil {
-	// 			return err
-	// 		}
-	// 		go b.handleConnection(conn, errc)
-	// 	}
-	// }
 }
 
 func (b *Broker) handleConnection(conn net.Conn, errc chan error) {
@@ -93,10 +78,12 @@ func (b *Broker) handleConnection(conn net.Conn, errc chan error) {
 			// Check if producer or consumer
 			switch serviceType {
 			case "producer":
-				if len(content) < 2 {
-					errc <- errors.New("Invalid topic")
+				if len(content) < 2 || content[1] == "" {
+					_, _ = conn.Write([]byte("NOT"))
+					errc <- errors.New("Topic required")
 					return
 				}
+
 				b.Publishers[conn.RemoteAddr().String()] = content[1]
 			case "consumer":
 			default:
@@ -122,7 +109,6 @@ func (b *Broker) read(conn net.Conn) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	fmt.Println("Received:", buff[:n])
 	return buff[:n], nil
 }
 
@@ -214,14 +200,12 @@ func NewProducer(ctx context.Context, addr string, topic string) *Producer {
 func (p *Producer) Start() (net.Conn, error) {
 	conn, err := net.Dial("tcp", p.Addr)
 	if err != nil {
-		conn.Close()
 		return nil, err
 	}
 
-	// Register serivce on start-up
+	// Register service on start-up
 	err = p.Register(conn)
 	if err != nil {
-		conn.Close()
 		return nil, err
 	}
 	return conn, nil

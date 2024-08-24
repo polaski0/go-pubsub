@@ -2,42 +2,39 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"log"
+	"net"
 	"testing"
+	"time"
 )
 
-func setup() *Broker {
+func setup() (*Broker, net.Listener) {
 	addr := ":8080"
 	ctx := context.Background()
 	broker := NewBroker(ctx, addr)
 	listener, err := broker.Start()
-	fmt.Println("Started broker server on:", listener.Addr().String())
 	if err != nil {
-		log.Fatal("Unable to start the broker server", err)
+		log.Fatalf("Unable to start the broker server: %v\n", err)
 	}
-	go func() {
-		err := broker.Listen(listener)
-		if err != nil {
-			listener.Close()
-			log.Fatal("Error occured while running the server", err)
-		}
-	}()
-	return broker
+	return broker, listener
 }
 
-func TestSubscription(t *testing.T) {
-	b := setup()
+func TestPublisherRegister(t *testing.T) {
+	b, listener := setup()
+	defer listener.Close()
+
+	errc := make(chan error)
+	go b.Listen(listener, errc)
 
 	addr := "localhost:8080"
 	ctx := context.Background()
 	topic := "topic"
 	producer := NewProducer(ctx, addr, topic)
 	conn, err := producer.Start()
-	fmt.Printf("Started producer on `%v` with topic `%v`\n", conn.LocalAddr().String(), producer.Topic)
 	if err != nil {
 		t.Error("Unable to start producer server", err)
 	}
+	defer conn.Close()
 
 	testCase := struct {
 		value    string
@@ -56,6 +53,34 @@ func TestSubscription(t *testing.T) {
 
 	if testCase.expected != p {
 		t.Errorf("Expected %v, found %v\n", testCase.expected, p)
+	}
+
+	for {
+		select {
+		case err := <-errc:
+			if err != nil {
+				t.Errorf("Error %v\n", err)
+			}
+		case <-time.After(1 * time.Second):
+			return
+		}
+	}
+}
+
+func TestFailedRegister(t *testing.T) {
+	b, listener := setup()
+	defer listener.Close()
+
+	errc := make(chan error)
+	go b.Listen(listener, errc)
+
+	addr := "localhost:8080"
+	ctx := context.Background()
+	topic := ""
+	producer := NewProducer(ctx, addr, topic)
+	conn, err := producer.Start()
+	if err == nil && conn != nil {
+		t.Error("Should not start the server since unregistered")
 	}
 }
 
