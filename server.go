@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"slices"
 	"sync"
+	"time"
 )
 
 const (
@@ -26,7 +28,7 @@ type Broker struct {
 	mux         *sync.Mutex
 	Addr        string
 	Topics      []string
-	Publishers  map[string]string     // address of producer = topic (one topic per producer only)
+	Publishers  map[net.Conn]string   // address of producer = topic (one topic per producer only)
 	Subscribers map[string][]net.Conn // topic = addresses of consumers subscribed to the topic
 }
 
@@ -36,7 +38,7 @@ func NewBroker(ctx context.Context, addr string) *Broker {
 		mux:         &sync.Mutex{},
 		Addr:        addr,
 		Topics:      []string{},
-		Publishers:  map[string]string{},
+		Publishers:  map[net.Conn]string{},
 		Subscribers: map[string][]net.Conn{},
 	}
 }
@@ -60,8 +62,19 @@ func (b *Broker) Listen(listener net.Listener, errc chan error) {
 	}
 }
 
+// Fix handling of errors
 func (b *Broker) handleConnection(conn net.Conn, errc chan error) {
-	reqc := make(chan any) // Fix receiving channel
+	reqc := make(chan string) // Fix receiving channel
+
+	go func() {
+		for r := range reqc {
+			fmt.Println("Broadcasting...")
+			err := b.Broadcast(conn, r)
+			if err != nil {
+				fmt.Println("Error broadcasting:", err)
+			}
+		}
+	}()
 
 	for {
 		body, err := b.read(conn)
@@ -70,21 +83,23 @@ func (b *Broker) handleConnection(conn net.Conn, errc chan error) {
 		}
 
 		action, content := ParseRequest(body)
+		fmt.Printf("[%v] Message received: %v, ", time.Now(), action, content)
 
 		// Do necessary operations based on the action received
 		switch action {
 		case "register":
+			// Fix storing of services
 			serviceType := content[0]
 			// Check if producer or consumer
 			switch serviceType {
 			case "producer":
 				if len(content) < 2 || content[1] == "" {
-					_, _ = conn.Write([]byte("NOT"))
+					_, _ = conn.Write([]byte("NOT OK"))
 					errc <- errors.New("Topic required")
 					return
 				}
 
-				b.Publishers[conn.RemoteAddr().String()] = content[1]
+				b.Publishers[conn] = content[1]
 			case "consumer":
 			default:
 				errc <- errors.New("Invalid service type")
@@ -96,15 +111,32 @@ func (b *Broker) handleConnection(conn net.Conn, errc chan error) {
 				errc <- err
 			}
 		case "pub":
-			reqc <- content
+			fmt.Println("Publishing...", action, content)
+			if len(content) < 1 {
+				_, _ = conn.Write([]byte("NOT OK"))
+				errc <- errors.New("Body required")
+				return
+			}
+			reqc <- content[0]
 		case "sub":
+			if len(content) < 1 {
+				_, _ = conn.Write([]byte("NOT OK"))
+				errc <- errors.New("Topic required")
+				return
+			}
+			b.Subscribe(conn, content[0])
+			fmt.Println("Subscriber added:", conn.LocalAddr().String())
+			_, err := conn.Write([]byte("OK"))
+			if err != nil {
+				errc <- err
+			}
 		case "unsub":
 		}
 	}
 }
 
 func (b *Broker) read(conn net.Conn) ([]byte, error) {
-	buff := make([]byte, 1024*8)
+	buff := make([]byte, 1024*8) // 8 KB
 	n, err := conn.Read(buff)
 	if err != nil {
 		return nil, err
@@ -113,6 +145,28 @@ func (b *Broker) read(conn net.Conn) ([]byte, error) {
 }
 
 func (b *Broker) write(conn net.Conn, value []byte) error {
+	_, err := conn.Write(value)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (b *Broker) Broadcast(conn net.Conn, content string) error {
+	topic, ok := b.Publishers[conn]
+	if !ok {
+		return errors.New("Publisher does not exist")
+	}
+
+	subscribers, ok := b.Subscribers[topic]
+	if !ok {
+		return errors.New("Topic does not exist")
+	}
+
+	for _, s := range subscribers {
+		_ = b.write(s, []byte(content))
+	}
+
 	return nil
 }
 
@@ -130,7 +184,7 @@ func (b *Broker) write(conn net.Conn, value []byte) error {
 //
 //   - register^]consumer -- the request is a consumer
 //   - register^]producer^]topic -- the request is a producer of `topic`
-//   - pub^]topic -- the request is from a producer publishing on its own `topic`
+//   - pub^]body -- the request is from a producer publishing on its own `topic`
 //   - sub^]topic -- the request is from a consumer subscribing to `topic`
 //   - unsub^]topic -- the request is from a consumer unsubscribing to `topic`
 func ParseRequest(b []byte) (string, []string) {
@@ -148,7 +202,7 @@ func ParseRequest(b []byte) (string, []string) {
 }
 
 // Add consumer to the `Subscribers` map
-func (b *Broker) Subscribe(topic string, conn net.Conn) {
+func (b *Broker) Subscribe(conn net.Conn, topic string) {
 	b.mux.Lock()
 	defer b.mux.Unlock()
 	consumers, ok := b.Subscribers[topic]
@@ -164,7 +218,7 @@ func (b *Broker) Subscribe(topic string, conn net.Conn) {
 }
 
 // Remove consumer from the `Subscribers` map
-func (b *Broker) Unsubscribe(topic string, conn net.Conn) {
+func (b *Broker) Unsubscribe(conn net.Conn, topic string) {
 	b.mux.Lock()
 	defer b.mux.Unlock()
 	consumers, ok := b.Subscribers[topic]
